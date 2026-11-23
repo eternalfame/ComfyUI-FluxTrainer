@@ -404,8 +404,9 @@ class OptimizerConfigProdigyPlusScheduleFree:
             "use_grams": ("BOOLEAN",{"default": False, "tooltip": "Perform 'grams' updates, as proposed in https://arxiv.org/abs/2412.17107. Modifies the update using sign operations that align with the current gradient. Note that we do not have access to a first moment, so this deviates from the paper (we apply the sign directly to the update). May have a limited effect."}),
             "stochastic_rounding": ("BOOLEAN",{"default": True, "tooltip": "Use stochastic rounding for bfloat16 weights"}),
             "use_orthograd": ("BOOLEAN",{"default": False, "tooltip": "Experimental. Updates weights using the component of the gradient that is orthogonal to the current weight direction, as described in (https://arxiv.org/pdf/2501.04697). Can help prevent overfitting and improve generalisation."}),
-            "use_focus ": ("BOOLEAN",{"default": False, "tooltip": "Experimental. Modifies the update step to better handle noise at large step sizes. (https://arxiv.org/abs/2501.12243). This method is incompatible with factorisation, Muon and Adam-atan2."}),
+            "use_focus": ("BOOLEAN",{"default": False, "tooltip": "Experimental. Modifies the update step to better handle noise at large step sizes. (https://arxiv.org/abs/2501.12243). This method is incompatible with factorisation, Muon and Adam-atan2."}),
             "extra_optimizer_args": ("STRING",{"multiline": True, "default": "", "tooltip": "additional optimizer args"}),
+            "fast": ("BOOLEAN",{"default": False, "tooltip": "Use custom fast prodigy-plus-schedule-free"}),
            },
         }
 
@@ -417,10 +418,15 @@ class OptimizerConfigProdigyPlusScheduleFree:
     def create_config(self, min_snr_gamma, use_bias_correction, extra_optimizer_args, **kwargs):
         kwargs["optimizer_type"] = "ProdigyPlusScheduleFree"
         kwargs["lr_scheduler"] = "constant"
+        kwargs["learning_rate"] = kwargs.pop("lr")
         extra_args = [arg.strip() for arg in extra_optimizer_args.strip().split('|') if arg.strip()]
-        node_args = [
-                f"use_bias_correction={use_bias_correction}",
-            ]
+        opt_kwargs = {key: kwargs.pop(key) for key in (
+            "prodigy_steps", "d0", "d_coef", "split_groups", "use_stableadamw", "use_cautious",
+            "use_adopt", "use_grams", "stochastic_rounding", "use_orthograd", "use_focus"
+        )}
+        opt_kwargs["use_bias_correction"] = use_bias_correction
+        fast = kwargs.pop("fast")
+        node_args = [f"{key}={value!r}" for key, value in opt_kwargs.items()] + [f"fast={fast!r}"]
         kwargs["optimizer_args"] = node_args + extra_args
         kwargs["min_snr_gamma"] = min_snr_gamma if min_snr_gamma != 0.0 else None
         

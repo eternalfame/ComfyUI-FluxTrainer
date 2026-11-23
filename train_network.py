@@ -753,6 +753,11 @@ class NetworkTrainer:
             for i in reversed(remove_indices):
                 if len(weights) > i:
                     weights.pop(i)
+            checkpoint_optimizer = getattr(optimizer, "optimizer", optimizer)
+            prepare_model_state = getattr(checkpoint_optimizer, "prepare_model_state_for_save", None)
+            if prepare_model_state is not None:
+                for state_dict in weights:
+                    prepare_model_state(state_dict)
             # print(f"save model hook: {len(weights)} weights will be saved")
 
             # Store the completed update and its epoch, including on an exact epoch boundary.
@@ -782,6 +787,12 @@ class NetworkTrainer:
                     data = json.load(f)
                 steps_from_state = data["current_step"]
                 logger.info(f"load train state from {train_state_file}: {data}")
+
+            checkpoint_optimizer = getattr(optimizer, "optimizer", optimizer)
+            load_checkpoint_model = getattr(checkpoint_optimizer, "load_checkpoint_model", None)
+            if load_checkpoint_model is not None and len(models) == 1:
+                if load_checkpoint_model(accelerator.unwrap_model(models[0]), input_dir, steps_from_state):
+                    models.pop()
 
         accelerator.register_save_state_pre_hook(save_model_hook)
         accelerator.register_load_state_pre_hook(load_model_hook)

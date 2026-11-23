@@ -118,7 +118,10 @@ class LoRAModule(torch.nn.Module):
 
         lx = self.lora_up(lx)
 
-        return org_forwarded + lx * self.multiplier * scale
+        mult = self.multiplier * scale
+        if mult == 1.0:
+            return org_forwarded + lx
+        return torch.add(org_forwarded, lx, alpha=mult)
 
 
 class LoRAInfModule(LoRAModule):
@@ -1254,7 +1257,7 @@ class LoRANetwork(torch.nn.Module):
         if dtype is not None:
             for key in list(state_dict.keys()):
                 v = state_dict[key]
-                v = v.detach().clone().to("cpu").to(dtype)
+                v = v.detach().to(dtype=dtype).to("cpu")
                 state_dict[key] = v
 
         if os.path.splitext(file)[1] == ".safetensors":
