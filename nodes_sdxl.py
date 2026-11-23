@@ -176,8 +176,8 @@ class InitSDXLLoRATraining:
             "network_args": None if network_config is None else network_config["network_args"],
         }
         attention_settings = {
-            "sdpa": {"mem_eff_attn": True, "xformers": False, "spda": True},
-            "xformers": {"mem_eff_attn": True, "xformers": True, "spda": False}
+            "sdpa": {"mem_eff_attn": False, "xformers": False, "sdpa": True},
+            "xformers": {"mem_eff_attn": False, "xformers": True, "sdpa": False},
         }
         config_dict.update(attention_settings.get(attention_mode, {}))
 

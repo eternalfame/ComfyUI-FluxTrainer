@@ -22,6 +22,7 @@ def prepare_scheduler_for_custom_training(noise_scheduler, device):
     sigma = sqrt_one_minus_alphas_cumprod
     all_snr = (alpha / sigma) ** 2
 
+    noise_scheduler.alphas_cumprod = noise_scheduler.alphas_cumprod.to(device)
     noise_scheduler.all_snr = all_snr.to(device)
 
 
