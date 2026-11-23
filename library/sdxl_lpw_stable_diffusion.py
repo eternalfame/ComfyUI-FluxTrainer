@@ -2,6 +2,7 @@
 # and modify to support SD2.x
 
 import inspect
+import os
 import re
 from typing import Callable, List, Optional, Union
 
@@ -963,11 +964,40 @@ class SdxlStableDiffusionLongPromptWeightingPipeline:
         self.unet.to(unet_dtype)
         return latents
 
+    def latents_to_images(self, latents_list):
+        if not latents_list:
+            return []
+        device = self._execution_device
+
+        tiling = (os.environ.get("FLUXTRAINER_VAE_TILING", "1") != "0"
+                  and hasattr(self.vae, "enable_tiling") and hasattr(self.vae, "disable_tiling"))
+        evict = (not tiling
+                 and hasattr(self.unet, "move_to_device_except_swap_blocks")
+                 and not any(p.requires_grad for p in self.unet.parameters()))
+        if evict:
+            self.unet.to("cpu")
+        torch.cuda.empty_cache()
+
+        results = []
+        self.vae.to(device)
+        if tiling:
+            self.vae.enable_tiling()
+        try:
+            for latents in latents_list:
+                image, tensors = self.decode_latents(latents.to(self.vae.dtype))
+                results.append((self.numpy_to_pil(image), tensors))
+        finally:
+            if tiling:
+                self.vae.disable_tiling()
+            self.vae.to("cpu")
+            torch.cuda.empty_cache()
+            if evict:
+                self.unet.move_to_device_except_swap_blocks(device)
+        return results
+
     def latents_to_image(self, latents):
         # 9. Post-processing
-        image, tensors = self.decode_latents(latents.to(self.vae.dtype))
-        image = self.numpy_to_pil(image)
-        return image, tensors
+        return self.latents_to_images([latents])[0]
 
     # copy from pil_utils.py
     def numpy_to_pil(self, images: np.ndarray) -> Image.Image:

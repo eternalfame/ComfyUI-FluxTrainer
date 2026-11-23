@@ -209,11 +209,11 @@ def get_timestep_embedding(x, outdim):
     return emb
 
 
-def get_size_embeddings(orig_size, crop_size, target_size, device):
+def get_size_embeddings(orig_size, crop_size, target_size, device, weight_dtype=None):
     emb1 = get_timestep_embedding(orig_size, 256)
     emb2 = get_timestep_embedding(crop_size, 256)
     emb3 = get_timestep_embedding(target_size, 256)
-    vector = torch.cat([emb1, emb2, emb3], dim=1).to(device)
+    vector = torch.cat([emb1, emb2, emb3], dim=1).to(device, dtype=weight_dtype)
     return vector
 
 

@@ -42,11 +42,19 @@ from .library.custom_train_functions import (
     apply_masked_loss,
 )
 from .library.utils import setup_logging, add_logging_arguments
+from .library.te_gpu import TransientGpuTextEncoders
 
 setup_logging()
 import logging
 
 logger = logging.getLogger(__name__)
+
+
+
+def _cuda_alloc_counters():
+    """Return CUDA allocator segment and retry counters."""
+    st = torch.cuda.memory_stats()
+    return st.get("segment.all.allocated", 0), st.get("num_alloc_retries", 0)
 
 
 class NetworkTrainer:
@@ -233,13 +241,6 @@ class NetworkTrainer:
         # with noise offset and/or multires noise if specified
         noise, noisy_latents, timesteps = train_util.get_noise_noisy_latents_and_timesteps(args, noise_scheduler, latents)
 
-        # ensure the hidden state will require grad
-        if args.gradient_checkpointing:
-            for x in noisy_latents:
-                x.requires_grad_(True)
-            for t in text_encoder_conds:
-                t.requires_grad_(True)
-
         # Predict the noise residual
         with accelerator.autocast():
             noise_pred = self.call_unet(
@@ -323,12 +324,21 @@ class NetworkTrainer:
     # endregion
 
     def init_train(self, args):
+        memory_fraction = None
+        memory_cap_requested = getattr(args, "cuda_memory_cap_percent", None) is not None
+        if torch.cuda.is_available() and (self.is_sdxl or memory_cap_requested or not args.highvram):
+            memory_fraction = train_util.get_training_memory_fraction(args)
+            torch.cuda.set_per_process_memory_fraction(memory_fraction)
+
         session_id = random.randint(0, 2**32)
         training_started_at = time.time()
         train_util.verify_training_args(args)
         train_util.prepare_dataset_args(args, True)
         deepspeed_utils.prepare_deepspeed_args(args)
         setup_logging(args, reset=True)
+        if self.is_sdxl and memory_fraction is not None:
+            cap = f"{memory_fraction * 100:g}%" if memory_fraction < 1.0 else "off"
+            logger.info("SDXL CUDA allocator: %s, memory cap: %s", torch.cuda.get_allocator_backend(), cap)
 
         cache_latents = args.cache_latents
         use_dreambooth_method = args.in_json is None
@@ -1121,6 +1131,15 @@ class NetworkTrainer:
             text_encoders = []
             text_encoder = None
 
+        text_encoder_device = getattr(args, "text_encoder_device", "cpu")
+        cpu_text_encoders = self.is_sdxl and not train_text_encoder and text_encoder_device != "gpu"
+        gpu_te = None
+        if (cpu_text_encoders and text_encoder_device == "transient_gpu" and not args.weighted_captions
+                and not getattr(args, "cache_text_encoder_outputs", False)
+                and len(text_encoders) > 0 and accelerator.device.type == "cuda"):
+            gpu_te = TransientGpuTextEncoders(text_encoders, accelerator.device, weight_dtype)
+            logger.info("text encoders: %s pinned copies, transient GPU encoding enabled", weight_dtype)
+
         # For --sample_at_first
         #self.sample_images(accelerator, args, 0, global_step, accelerator.device, vae, tokenizers, text_encoder, unet)
 
@@ -1158,6 +1177,7 @@ class NetworkTrainer:
         self.comfy_pbar = None
         
         progress_bar = tqdm(total=args.max_train_steps, initial=resumed_global_step, smoothing=0, disable=False, desc="steps")
+        log_step_stats = bool(getattr(args, "log_step_stats", False)) and torch.cuda.is_available()
         
         def training_loop(break_at_steps, epoch):
             break_at_steps = min(break_at_steps, args.max_train_steps)
@@ -1178,6 +1198,10 @@ class NetworkTrainer:
                 self.initial_step = 1
 
             for step, batch in enumerate(skipped_dataloader or train_dataloader):
+                clean_every = getattr(args, "clean_memory_every_n_steps", 5)
+                if clean_every > 0 and not step % clean_every:
+                    clean_memory_on_device(accelerator.device)
+
                 current_step.value = self.global_step
                 if self.initial_step > 0:
                     self.initial_step -= 1
@@ -1187,6 +1211,12 @@ class NetworkTrainer:
                     displayed_epoch = current_epoch.value
                     progress_bar.set_description(f"Epoch {displayed_epoch}/{num_train_epochs} - steps")
 
+                if log_step_stats:
+                    te_time = opt_time = 0.0
+                    step_t0 = time.perf_counter()
+                    alloc0 = _cuda_alloc_counters()
+                    torch.cuda.reset_peak_memory_stats()
+
                 with accelerator.accumulate(training_model):
                     on_step_start_for_network(text_encoder, unet)
 
@@ -1194,7 +1224,7 @@ class NetworkTrainer:
                     self.on_step_start(args, accelerator, network, text_encoders, unet, batch, weight_dtype)
 
                     if "latents" in batch and batch["latents"] is not None:
-                        latents = batch["latents"].to(accelerator.device).to(dtype=weight_dtype)
+                        latents = batch["latents"].to(accelerator.device, dtype=weight_dtype)
                     else:
                         with torch.no_grad():
                             # encode latents
@@ -1219,6 +1249,8 @@ class NetworkTrainer:
                         # print(f"set multiplier: {multipliers}")
                         accelerator.unwrap_model(network).set_multiplier(multipliers)
 
+                    if log_step_stats:
+                        te_t0 = time.perf_counter()
                     text_encoder_conds = []
                     text_encoder_outputs_list = batch.get("text_encoder_outputs_list", None)
                     if text_encoder_outputs_list is not None:
@@ -1237,14 +1269,20 @@ class NetworkTrainer:
                                     weights_list,
                                 )
                             else:
-                                input_ids = [ids.to(accelerator.device) for ids in batch["input_ids_list"]]
-                                encoded_text_encoder_conds = text_encoding_strategy.encode_tokens(
-                                    tokenize_strategy,
-                                    self.get_models_for_text_encoding(args, accelerator, text_encoders),
-                                    input_ids,
-                                )
-                            if args.full_fp16:
-                                encoded_text_encoder_conds = [c.to(weight_dtype) for c in encoded_text_encoder_conds]
+                                if gpu_te is not None:
+                                    with torch.no_grad(), gpu_te.on_device() as gpu_models:
+                                        encoded_text_encoder_conds = text_encoding_strategy.encode_tokens(
+                                            tokenize_strategy, gpu_models, list(batch["input_ids_list"]))
+                                else:
+                                    token_device = "cpu" if cpu_text_encoders else accelerator.device
+                                    input_ids = [ids.to(token_device) if ids is not None else None for ids in batch["input_ids_list"]]
+                                    encoded_text_encoder_conds = text_encoding_strategy.encode_tokens(
+                                        tokenize_strategy, self.get_models_for_text_encoding(args, accelerator, text_encoders), input_ids)
+                            if self.is_sdxl or args.full_fp16:
+                                encoded_text_encoder_conds = [
+                                    c.to(accelerator.device, dtype=weight_dtype if c.is_floating_point() else c.dtype)
+                                    if c is not None else None for c in encoded_text_encoder_conds
+                                ]
 
                         # if text_encoder_conds is not cached, use encoded_text_encoder_conds
                         if len(text_encoder_conds) == 0:
@@ -1254,6 +1292,11 @@ class NetworkTrainer:
                             for i in range(len(encoded_text_encoder_conds)):
                                 if encoded_text_encoder_conds[i] is not None:
                                     text_encoder_conds[i] = encoded_text_encoder_conds[i]
+
+                    if not train_text_encoder:
+                        text_encoder_conds = [c.detach() if c is not None else None for c in text_encoder_conds]
+                    if log_step_stats:
+                        te_time = time.perf_counter() - te_t0
 
                     # sample noise, call unet, get target
                     noise_pred, target, timesteps, weighting = self.get_noise_pred_and_target(
@@ -1286,15 +1329,24 @@ class NetworkTrainer:
                     loss = loss.mean()  # No need to divide by batch_size since it's an average
 
                     accelerator.backward(loss)
+                    if self.is_sdxl and getattr(args, "blocks_to_swap", 0):
+                        accelerator.unwrap_model(unet).offload_all_swap_blocks()
+
                     if accelerator.sync_gradients:
                         self.all_reduce_network(accelerator, network)  # sync DDP grad manually
                         if args.max_grad_norm != 0.0:
                             params_to_clip = accelerator.unwrap_model(network).get_trainable_params()
                             accelerator.clip_grad_norm_(params_to_clip, args.max_grad_norm)
 
+                    if log_step_stats:
+                        torch.cuda.synchronize()
+                        opt_t0 = time.perf_counter()
                     optimizer.step()
                     lr_scheduler.step()
                     optimizer.zero_grad(set_to_none=True)
+                    if log_step_stats:
+                        torch.cuda.synchronize()
+                        opt_time = time.perf_counter() - opt_t0
 
                 if args.scale_weight_norms:
                     keys_scaled, mean_norm, maximum_norm = accelerator.unwrap_model(network).apply_max_norm_regularization(
@@ -1315,6 +1367,18 @@ class NetworkTrainer:
                         self.comfy_pbar.update_absolute(self.global_step - getattr(self, "comfy_pbar_base", 0))
 
                 current_loss = loss.detach().item()
+                if log_step_stats:
+                    now = time.perf_counter()
+                    alloc1 = _cuda_alloc_counters()
+                    last_end = getattr(self, "_last_step_end", None)
+                    gap = (step_t0 - last_end) if last_end is not None else 0.0
+                    self._last_step_end = now
+                    logger.info(
+                        f"step {self.global_step}: {now - step_t0:.2f}s (idle before: {gap:.1f}s, text enc {te_time:.2f}s, optimizer {opt_time:.2f}s) | "
+                        f"alloc {torch.cuda.memory_allocated() / 2**30:.2f} / reserved {torch.cuda.memory_reserved() / 2**30:.2f} / "
+                        f"peak {torch.cuda.max_memory_allocated() / 2**30:.2f} GB | "
+                        f"cudaMalloc +{alloc1[0] - alloc0[0]} | alloc retries +{alloc1[1] - alloc0[1]}"
+                    )
                 self.loss_recorder.add(epoch=epoch, step=step, global_step=self.global_step, loss=current_loss)
                 avr_loss: float = self.loss_recorder.moving_average
                 logs = {"avr_loss": avr_loss, "lr": lr_scheduler.get_last_lr()[0]}
@@ -1500,6 +1564,42 @@ def setup_parser() -> argparse.ArgumentParser:
     # parser.add_argument("--loraplus_lr_ratio", default=None, type=float, help="LoRA+ learning rate ratio")
     # parser.add_argument("--loraplus_unet_lr_ratio", default=None, type=float, help="LoRA+ UNet learning rate ratio")
     # parser.add_argument("--loraplus_text_encoder_lr_ratio", default=None, type=float, help="LoRA+ text encoder learning rate ratio")
+    parser.add_argument(
+        "--cuda_memory_cap_percent",
+        type=int,
+        choices=range(101),
+        metavar="0-100",
+        default=None,
+        help="CUDA allocation cap as a percent of total VRAM. Use 0 to disable the cap. Defaults to 90%% unless high VRAM mode is enabled.",
+    )
+    parser.add_argument(
+        "--text_encoder_device", choices=("cpu", "gpu", "transient_gpu"),
+        help="Placement of frozen SDXL text encoders (default: cpu). transient_gpu moves pinned copies to CUDA for live, unweighted training captions.",
+    )
+    parser.add_argument(
+        "--te_gpu_encode",
+        dest="text_encoder_device",
+        action="store_const",
+        const="transient_gpu",
+        default=argparse.SUPPRESS,
+        help=argparse.SUPPRESS,
+    )
+    parser.add_argument(
+        "--clean_memory_every_n_steps",
+        type=int,
+        default=5,
+        help="gc.collect() + torch.cuda.empty_cache() every N steps (0 disables).",
+    )
+    parser.add_argument(
+        "--swap_arena",
+        action="store_true",
+        help="Load swapped blocks from pinned host chunks into one persistent GPU arena. Experimental.",
+    )
+    parser.add_argument(
+        "--log_step_stats",
+        action="store_true",
+        help="log per-step time (without idle time between nodes), allocator state and cudaMalloc/retry counts",
+    )
     return parser
 
 

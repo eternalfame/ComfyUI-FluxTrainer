@@ -26,6 +26,14 @@ Both these nodes and the underlaying implementation by kohya is work in progress
 
 In addition torch version 2.4.0 or higher is highly recommended.
 
+### SDXL CUDA memory
+
+The **Init SDXL LoRA Training** node accepts an optional `cuda_memory_cap_percent` with a widget default of 90%. Set it to `0` to disable the cap. This setting limits PyTorch device allocations and leaves pinned host memory outside the cap. Workflows that omit the input use 90% in normal mode and the full CUDA budget in high-VRAM mode. Validation temporarily uses the full CUDA budget and restores the training cap afterward.
+
+To use `cudaMallocAsync`, start ComfyUI with `--cuda-malloc`. For standalone training, set `PYTORCH_CUDA_ALLOC_CONF=backend:cudaMallocAsync` before launching Python. The allocator is selected when the process starts, and the SDXL trainer logs the active backend and cap.
+
+`text_encoder_device` controls placement for both frozen SDXL text encoders. The default, `cpu`, keeps them in system RAM. `gpu` keeps them on the training device. `transient_gpu` keeps the original encoders on CPU for validation and loads pinned copies onto CUDA for live, unweighted training captions. It uses about 1.5 GiB of additional pinned host memory in fp16. Building the text-output cache and training text-encoder adapters use the training device in all modes.
+
 Example workflow for LoRA training can be found in the examples folder, it utilizes additional nodes from:
 
 https://github.com/kijai/ComfyUI-KJNodes

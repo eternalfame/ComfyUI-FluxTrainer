@@ -17,11 +17,53 @@ import logging
 logger = logging.getLogger(__name__)
 
 
+def make_offload_hooks(unet, min_numel=1 << 18):
+    param_ids = {id(p) for p in unet.parameters()}
+    def pack(t):
+        if (t.device.type != "cuda" or t.numel() < min_numel
+                or isinstance(t, torch.nn.Parameter) or id(t) in param_ids):
+            return t
+        buf = torch.empty(t.shape, dtype=t.dtype, pin_memory=True)
+        buf.copy_(t, non_blocking=True)
+        ev = torch.cuda.Event(); ev.record()
+        return (t.device, buf, ev)
+    def unpack(x):
+        if isinstance(x, torch.Tensor):
+            return x
+        dev, buf, ev = x
+        ev.synchronize()
+        return buf.to(dev, non_blocking=True)
+    return pack, unpack
+
+
 class SdxlNetworkTrainer(train_network.NetworkTrainer):
     def __init__(self):
         super().__init__()
+        self._size_emb_cache = {}
         self.vae_scale_factor = sdxl_model_util.VAE_SCALE_FACTOR
         self.is_sdxl = True
+
+    def init_train(self, args):
+        legacy_gpu_encode = vars(args).pop("te_gpu_encode", False)
+        if getattr(args, "text_encoder_device", None) is None:
+            args.text_encoder_device = "transient_gpu" if legacy_gpu_encode else "cpu"
+
+        if getattr(args, "output_only_lora", False):
+            if args.network_module != ".networks.lora" or not args.network_train_unet_only or args.network_train_text_encoder_only:
+                raise ValueError("Output-only SDXL LoRA requires the standard LoRA network and frozen text encoders.")
+            if args.dim_from_weights:
+                raise ValueError("Output-only SDXL LoRA requires ranks from the node. Remove --dim_from_weights.")
+
+            ranks = [0] * 13 + [args.network_dim] * 9 + [0]
+            block_dims = "block_dims=" + ",".join(map(str, ranks))
+            network_args = list(args.network_args or [])
+            if any(arg.partition("=")[0] in {"block_dims", "conv_dim", "conv_block_dims"} and arg != block_dims
+                   for arg in network_args):
+                raise ValueError("Output-only SDXL LoRA sets the block ranks. Remove custom block or convolution ranks.")
+            if block_dims not in network_args:
+                args.network_args = [*network_args, block_dims]
+            logger.info("Experimental output-only SDXL LoRA enabled.")
+        return super().init_train(args)
 
     def assert_extra_args(self, args, train_dataset_group):
         super().assert_extra_args(args, train_dataset_group)
@@ -89,6 +131,10 @@ class SdxlNetworkTrainer(train_network.NetworkTrainer):
     def cache_text_encoder_outputs_if_needed(
         self, args, accelerator: Accelerator, unet, vae, text_encoders, dataset: train_util.DatasetGroup, weight_dtype
     ):
+        keep_on_accelerator = self.is_train_text_encoder(args) or getattr(args, "text_encoder_device", "cpu") == "gpu"
+        encoder_device = accelerator.device if keep_on_accelerator else torch.device("cpu")
+        encoder_dtype = torch.float32 if encoder_device.type == "cpu" else weight_dtype
+        logger.info("SDXL text encoders will reside on %s during training", encoder_device)
         if args.cache_text_encoder_outputs:
             if not args.lowram:
                 # メモリ消費を減らす
@@ -106,18 +152,16 @@ class SdxlNetworkTrainer(train_network.NetworkTrainer):
                 dataset.new_cache_text_encoder_outputs(text_encoders + [accelerator.unwrap_model(text_encoders[-1])], accelerator)
             accelerator.wait_for_everyone()
 
-            text_encoders[0].to("cpu", dtype=torch.float32)  # Text Encoder doesn't work with fp16 on CPU
-            text_encoders[1].to("cpu", dtype=torch.float32)
+        for encoder in text_encoders:
+            encoder.to(encoder_device, dtype=encoder_dtype)
+
+        if args.cache_text_encoder_outputs:
             clean_memory_on_device(accelerator.device)
 
             if not args.lowram:
                 logger.info("move vae and unet back to original device")
                 vae.to(org_vae_device)
                 unet.to(org_unet_device)
-        else:
-            # Text Encoderから毎回出力を取得するので、GPUに乗せておく
-            text_encoders[0].to(accelerator.device, dtype=weight_dtype)
-            text_encoders[1].to(accelerator.device, dtype=weight_dtype)
 
     def get_text_cond(self, args, accelerator, batch, tokenizers, text_encoders, weight_dtype):
         if "text_encoder_outputs1_list" not in batch or batch["text_encoder_outputs1_list"] is None:
@@ -185,13 +229,29 @@ class SdxlNetworkTrainer(train_network.NetworkTrainer):
         weight_dtype,
         indices: Optional[List[int]] = None,
     ):
+        if getattr(args, "output_only_lora", False):
+            noisy_latents = noisy_latents.detach()
         noisy_latents = noisy_latents.to(weight_dtype)  # TODO check why noisy_latents is not weight_dtype
 
         # get size embeddings
         orig_size = batch["original_sizes_hw"]
         crop_size = batch["crop_top_lefts"]
         target_size = batch["target_sizes_hw"]
-        embs = sdxl_train_util.get_size_embeddings(orig_size, crop_size, target_size, accelerator.device).to(weight_dtype)
+
+        key = (
+            tuple(orig_size.reshape(-1).tolist()),
+            tuple(crop_size.reshape(-1).tolist()),
+            tuple(target_size.reshape(-1).tolist()),
+            accelerator.device, weight_dtype,
+        )
+        if key not in self._size_emb_cache:
+            # Random crop coordinates can produce a new GPU tensor every update.
+            if len(self._size_emb_cache) >= 128:
+                del self._size_emb_cache[next(iter(self._size_emb_cache))]
+            self._size_emb_cache[key] = sdxl_train_util.get_size_embeddings(
+                orig_size, crop_size, target_size, accelerator.device, weight_dtype=weight_dtype
+            )
+        embs = self._size_emb_cache[key]
 
         # concat embeddings
         encoder_hidden_states1, encoder_hidden_states2, pool2 = text_conds
@@ -204,12 +264,30 @@ class SdxlNetworkTrainer(train_network.NetworkTrainer):
             text_embedding = text_embedding[indices]
             vector_embedding = vector_embedding[indices]
 
-        noise_pred = unet(noisy_latents, timesteps, text_embedding, vector_embedding)
+        pack, unpack = make_offload_hooks(unet)
+        with torch.autograd.graph.saved_tensors_hooks(pack, unpack):
+            noise_pred = unet(noisy_latents, timesteps, text_embedding, vector_embedding)
+
         return noise_pred
 
     def sample_images(self, accelerator, args, epoch, global_step, device, vae, tokenizer, text_encoder, unet, validation_settings=None):
         image_tensors = sdxl_train_util.sample_images(accelerator, args, epoch, global_step, device, vae, tokenizer, text_encoder, unet, validation_settings)
         return image_tensors
+
+    def prepare_unet_with_accelerator(self, args, accelerator, unet):
+        if not getattr(args, "blocks_to_swap", None):
+            return super().prepare_unet_with_accelerator(args, accelerator, unet)
+
+        keep_resident = (len(unet.input_blocks),) if getattr(args, "keep_middle_resident", False) else ()
+        unet.enable_block_swap(
+            args.blocks_to_swap, accelerator.device, use_arena=getattr(args, "swap_arena", False), keep_resident=keep_resident
+        )
+        unet = accelerator.prepare(unet, device_placement=[False])
+        unwrapped_unet = accelerator.unwrap_model(unet)
+        unwrapped_unet.move_to_device_except_swap_blocks(accelerator.device)
+        unwrapped_unet.prepare_block_swap_before_forward()
+        return unet
+
 
 def setup_parser() -> argparse.ArgumentParser:
     parser = train_network.setup_parser()

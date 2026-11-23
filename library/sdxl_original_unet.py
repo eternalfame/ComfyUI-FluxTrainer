@@ -21,7 +21,7 @@
         spatial_transformer_attn_type: softmax-xformers
         legacy: False
 """
-
+import itertools
 import math
 from types import SimpleNamespace
 from typing import Any, Optional
@@ -44,7 +44,7 @@ CONTEXT_DIM: int = 2048
 MODEL_CHANNELS: int = 320
 TIME_EMBED_DIM = 320 * 4
 
-USE_REENTRANT = True
+USE_REENTRANT = False
 
 # region memory efficient attention
 
@@ -70,6 +70,149 @@ def default(val, d):
 # flash attention forwards and backwards
 
 # https://arxiv.org/abs/2205.14135
+
+
+def _normalize_device(device):
+    if isinstance(device, str):
+        device = torch.device(device)
+
+    if device.type == 'cuda' and device.index is None:
+        device = torch.device('cuda', torch.cuda.current_device())
+    return device
+
+
+def prepare_swap_cache(module):
+    n_fro = n_tr = 0
+    for t in itertools.chain(module.parameters(), module.buffers()):
+        if getattr(t, "requires_grad", False):
+            n_tr += t.numel()
+            continue
+        t._cpu_pinned = t.data.detach().to("cpu").pin_memory()
+        t.data = t._cpu_pinned
+        n_fro += t.numel()
+    return n_fro, n_tr
+
+
+_ARENA_ALIGN = 512
+_HOST_CHUNK_BYTES = 16 << 20
+
+
+class _SwapArena:
+    """Reuse one GPU arena for sequential block transfers."""
+
+    def __init__(self):
+        self.tensor = None
+
+    def ensure(self, nbytes, device):
+        if self.tensor is None or self.tensor.numel() < nbytes or self.tensor.device != torch.device(device):
+            self.tensor = None
+            self.tensor = torch.empty(nbytes, dtype=torch.uint8, device=device)
+        return self.tensor
+
+
+class SwapPack:
+    """
+    Pack frozen weights into pinned host chunks and copy them into one shared GPU arena.
+    """
+
+    def __init__(self, module, arena):
+        self.arena = arena
+        self.tensors = list(itertools.chain(module.parameters(), module.buffers()))
+        self.loaded = False
+        self._build()
+
+    def _build(self):
+        self.layout = []
+        offset = 0
+        for t in self.tensors:
+            nbytes = t.numel() * t.element_size()
+            offset = (offset + _ARENA_ALIGN - 1) // _ARENA_ALIGN * _ARENA_ALIGN
+            self.layout.append((offset, nbytes, t.dtype, tuple(t.shape)))
+            offset += nbytes
+        self.total = max(offset, _ARENA_ALIGN)
+        self.cpu_chunks = []
+        self.cpu_views = []
+        first = 0
+        while first < len(self.layout):
+            start = self.layout[first][0]
+            last = first + 1
+            while last < len(self.layout):
+                off, size, _, _ = self.layout[last]
+                if off + size - start > _HOST_CHUNK_BYTES:
+                    break
+                last += 1
+            off, size, _, _ = self.layout[last - 1]
+            chunk = torch.empty(off + size - start, dtype=torch.uint8, pin_memory=True)
+            self.cpu_chunks.append((start, chunk))
+            for t, (off, nbytes, dtype, shape) in zip(self.tensors[first:last], self.layout[first:last]):
+                view = chunk.narrow(0, off - start, nbytes).view(dtype).view(shape)
+                view.copy_(t.data)
+                self.cpu_views.append(view)
+                t.data = view
+            first = last
+        self.loaded = False
+
+    def _cpu_state_valid(self):
+        return all(t.device.type == "cpu" and t.dtype == v.dtype and t.data_ptr() == v.data_ptr()
+                   for t, v in zip(self.tensors, self.cpu_views))
+
+    def load(self, device):
+        if self.loaded:
+            return
+        if not self._cpu_state_valid():
+            self._build()
+        gpu = self.arena.ensure(self.total, device)
+        for start, chunk in self.cpu_chunks:
+            gpu.narrow(0, start, chunk.numel()).copy_(chunk, non_blocking=True)
+        for t, (off, nbytes, dtype, shape) in zip(self.tensors, self.layout):
+            t.data = gpu[off:off + nbytes].view(dtype).view(shape)
+        self.loaded = True
+
+    def offload(self):
+        if self.loaded:
+            for t, v in zip(self.tensors, self.cpu_views):
+                t.data = v
+            self.loaded = False
+        elif not self._cpu_state_valid():
+            self._build()
+
+
+def _move_to_device(self : nn.Module, device : torch.device | str, log=False):
+    device = _normalize_device(device)
+    pack = getattr(self, "_swap_pack", None)
+    if pack is not None:
+        if device.type == "cpu":
+            pack.offload()
+        else:
+            pack.load(device)
+        return
+    for t in itertools.chain(self.parameters(), self.buffers()):
+        pinned = getattr(t, "_cpu_pinned", None)
+        if pinned is not None and t.device.type == "cpu" and t.dtype != pinned.dtype:
+            pinned = t._cpu_pinned = t.data.pin_memory()
+
+        if pinned is not None:
+            t.data = pinned if device.type == "cpu" else pinned.to(device, non_blocking=True)
+        else:
+            t.data = t.data.to(device)
+            if getattr(t, "grad", None) is not None:
+                t.grad.data = t.grad.data.to(device)
+
+
+class Swapper:
+    def __init__(self, module, device, condition, move_back_to_cpu=True):
+        self.module = module
+        self.device = device
+        self.condition = condition
+        self.move_back_to_cpu = move_back_to_cpu
+
+    def __enter__(self):
+        if self.condition:
+            _move_to_device(self.module, self.device)
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        if self.condition and self.move_back_to_cpu:
+            _move_to_device(self.module, 'cpu')
 
 
 class FlashAttentionFunction(torch.autograd.Function):
@@ -1018,6 +1161,12 @@ class SdxlUNet2DConditionModel(nn.Module):
             [GroupNorm32(32, self.model_channels), nn.SiLU(), nn.Conv2d(self.model_channels, self.out_channels, 3, padding=1)]
         )
 
+        self.swap_device = None
+        self.blocks_to_swap = None
+        self.swap_block_indices = set()
+        self._swap_hooks_registered = False
+        self._loaded_backward_index = None
+
     # region diffusers compatibility
     def prepare_config(self):
         self.config = SimpleNamespace()
@@ -1071,6 +1220,90 @@ class SdxlUNet2DConditionModel(nn.Module):
 
     # endregion
 
+    @property
+    def swappable_blocks(self):
+        return list(self.input_blocks) + [self.middle_block] + list(self.output_blocks) + [self.out]
+
+    @property
+    def swapping_blocks(self):
+        return [self.swappable_blocks[i] for i in self.swap_block_indices]
+
+    @property
+    def num_blocks(self):
+        return len(self.input_blocks) + 1 + len(self.output_blocks) + 1
+
+    def enable_block_swap(
+        self, num_blocks_to_swap: int, device: torch.device, use_arena: bool = False, *, keep_resident: tuple[int, ...] = ()
+    ):
+        blocks = self.swappable_blocks
+        self.blocks_to_swap = num_blocks_to_swap
+        self.swap_device = device
+
+        block_sizes = []
+        for i, block in enumerate(blocks):
+            if i in keep_resident:
+                continue
+            num_params = sum(p.numel() for p in block.parameters())
+            block_sizes.append((i, num_params))
+
+        block_sizes.sort(key=lambda x: x[1], reverse=True)
+        self.swap_block_indices = set(i for i, _ in block_sizes[:num_blocks_to_swap])
+
+        arena = _SwapArena() if use_arena else None
+        packs = []
+        tot_f = tot_t = 0
+        for i in self.swap_block_indices:
+            block = blocks[i]
+            tensors = list(itertools.chain(block.parameters(), block.buffers()))
+            if arena is not None and not any(t.requires_grad for t in tensors):
+                pack = SwapPack(block, arena)
+                block._swap_pack = pack
+                packs.append(pack)
+                tot_f += sum(t.numel() for t in tensors)
+            else:
+                f, t = prepare_swap_cache(block)
+                tot_f += f
+                tot_t += t
+        if packs:
+            arena.ensure(max(p.total for p in packs), device)
+        print(f"block swap: frozen {tot_f / 1e6:.0f}M (pinned in RAM), trainable {tot_t / 1e6:.1f}M"
+              + (f", arena {arena.tensor.numel() / 2**20:.0f} MB for {len(packs)} blocks" if packs else ""))
+
+    def move_to_device_except_swap_blocks(self, device: torch.device):
+        blocks = self.swappable_blocks
+        swap_ids = {id(t)
+                    for i in self.swap_block_indices
+                    for t in itertools.chain(blocks[i].parameters(), blocks[i].buffers())}
+        for t in itertools.chain(self.parameters(), self.buffers()):
+            if id(t) not in swap_ids:
+                t.data = t.data.to(device)
+
+    def prepare_block_swap_before_forward(self):
+        if not self.blocks_to_swap or self._swap_hooks_registered:
+            return
+
+        blocks = self.swappable_blocks
+        for index in self.swap_block_indices:
+            def make_pre_hook(index):
+                def pre_hook(module, grad_output):
+                    if self._loaded_backward_index != index:
+                        if self._loaded_backward_index is not None:
+                            _move_to_device(blocks[self._loaded_backward_index], 'cpu')
+                        _move_to_device(blocks[index], self.swap_device)
+                        self._loaded_backward_index = index
+                return pre_hook
+
+            hook = make_pre_hook(index)
+            for layer in blocks[index]:
+                layer.register_full_backward_pre_hook(hook)
+
+        self._swap_hooks_registered = True
+
+    def offload_all_swap_blocks(self):
+        for b in self.swapping_blocks:
+            _move_to_device(b, 'cpu')
+        self._loaded_backward_index = None
+
     def forward(self, x, timesteps=None, context=None, y=None, **kwargs):
         # broadcast timesteps to batch dimension
         timesteps = timesteps.expand(x.shape[0])
@@ -1100,18 +1333,27 @@ class SdxlUNet2DConditionModel(nn.Module):
         # h = x.type(self.dtype)
         h = x
 
-        for module in self.input_blocks:
-            h = call_module(module, h, emb, context)
+        self.offload_all_swap_blocks()
+
+        for block_idx, module in enumerate(self.input_blocks):
+            with Swapper(module, self.swap_device, block_idx in self.swap_block_indices):
+                h = call_module(module, h, emb, context)
             hs.append(h)
 
-        h = call_module(self.middle_block, h, emb, context)
+        mid_idx = len(self.input_blocks)
+        with Swapper(self.middle_block, self.swap_device, mid_idx in self.swap_block_indices):
+            h = call_module(self.middle_block, h, emb, context)
 
-        for module in self.output_blocks:
-            h = torch.cat([h, hs.pop()], dim=1)
-            h = call_module(module, h, emb, context)
+        for i, module in enumerate(self.output_blocks):
+            block_idx = mid_idx + 1 + i
+            with Swapper(module, self.swap_device, block_idx in self.swap_block_indices):
+                h = torch.cat([h, hs.pop()], dim=1)
+                h = call_module(module, h, emb, context)
 
         h = h.type(x.dtype)
-        h = call_module(self.out, h, emb, context)
+        block_idx = len(self.swappable_blocks) - 1
+        with Swapper(self.out, self.swap_device, block_idx in self.swap_block_indices):
+            h = call_module(self.out, h, emb, context)
 
         return h
 

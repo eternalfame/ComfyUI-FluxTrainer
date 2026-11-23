@@ -68,6 +68,7 @@ class InitSDXLLoRATraining:
             "cache_text_encoder_outputs": (["disk", "memory", "disabled"], {"tooltip": "caches text encoder outputs"}),
             "highvram": ("BOOLEAN", {"default": False, "tooltip": "memory mode"}),
             "blocks_to_swap": ("INT", {"default": 0, "min": 0, "max": 100, "step": 1, "tooltip": "option for memory use reduction. The maximum number of blocks that can be swapped is 36 for SDXL.5L and 22 for SDXL.5M"}),
+            "keep_middle_resident": ("BOOLEAN", {"default": False, "display_name": "keep middle block resident", "tooltip": "Keep the SDXL U-Net middle block on the GPU during block swapping. Uses more VRAM. Applies when blocks_to_swap is greater than zero."}),
             "fp8_base": ("BOOLEAN", {"default": False, "tooltip": "use fp8 for base model"}),
             "gradient_dtype": (["fp32", "fp16", "bf16"], {"default": "fp32", "tooltip": "the actual dtype training uses"}),
             "save_dtype": (["fp32", "fp16", "bf16", "fp8_e4m3fn", "fp8_e5m2"], {"default": "fp16", "tooltip": "the dtype to save checkpoints as"}),
@@ -75,16 +76,20 @@ class InitSDXLLoRATraining:
             "train_text_encoder": (['disabled', 'clip_l',], {"default": 'disabled', "tooltip": "also train the selected text encoders using specified dtype, T5 can not be trained without clip_l"}),
             "clip_l_lr": ("FLOAT", {"default": 0, "min": 0.0, "max": 10.0, "step": 0.000001, "tooltip": "text encoder learning rate"}),
             "clip_g_lr": ("FLOAT", {"default": 0, "min": 0.0, "max": 10.0, "step": 0.000001, "tooltip": "text encoder learning rate"}),
-            "sample_prompts_pos": ("STRING", {"multiline": True, "default": "illustration of a kitten | photograph of a turtle", "tooltip": "validation sample prompts, for multiple prompts, separate by `|`"}),
-            "sample_prompts_neg": ("STRING", {"multiline": True, "default": "", "tooltip": "validation sample prompts, for multiple prompts, separate by `|`"}),
+            "sample_prompts_pos": ("STRING", {"multiline": True, "default": "illustration of a kitten | photograph of a turtle", "tooltip": "Positive validation prompts. Booru tags can be comma-separated. Use | between prompts."}),
+            "sample_prompts_neg": ("STRING", {"multiline": True, "default": "", "tooltip": "Negative validation prompts. Booru tags can be comma-separated. Use | between prompts."}),
             "gradient_checkpointing": (["enabled", "disabled"], {"default": "enabled", "tooltip": "use gradient checkpointing"}),
             },
             "optional": {
                 "additional_args": ("STRING", {"multiline": True, "default": "", "tooltip": "additional args to pass to the training command"}),
+                "output_only_lora": ("BOOLEAN", {"default": False, "tooltip": "Experimental. Train standard LoRA adapters only in the SDXL U-Net output blocks, with both text encoders frozen."}),
+                "gradient_accumulation_steps": ("INT", {"default": 1, "min": 1, "max": 1024, "step": 1, "tooltip": "Number of training batches per optimizer update. Overrides additional_args when supplied."}),
                 "resume_args": ("ARGS", {"default": "", "tooltip": "resume args to pass to the training command"}),
                 "block_args": ("ARGS", {"default": "", "tooltip": "limit the blocks used in the LoRA"}),
                 "loss_args": ("ARGS", {"default": "", "tooltip": "loss args"}),
                 "network_config": ("NETWORK_CONFIG", {"tooltip": "additional network config"}),
+                "cuda_memory_cap_percent": ("INT", {"default": 90, "min": 0, "max": 100, "step": 1, "tooltip": "PyTorch CUDA device memory cap as a percent of total VRAM. Set to 0 to disable the cap. Validation temporarily uses the full CUDA budget."}),
+                "text_encoder_device": (["cpu", "gpu", "transient_gpu"], {"default": "cpu", "tooltip": "Placement for frozen SDXL text encoders. cpu keeps them in RAM, gpu keeps them on the training GPU, and transient_gpu loads pinned copies onto CUDA for live, unweighted training captions. Cache creation and text encoder training use the training device."}),
             },
             "hidden": {
                 "prompt": "PROMPT", "extra_pnginfo": "EXTRA_PNGINFO"
@@ -98,7 +103,8 @@ class InitSDXLLoRATraining:
 
     def init_training(self, SDXL_models, dataset, optimizer_settings, sample_prompts_pos, sample_prompts_neg, output_name, attention_mode, 
                       gradient_dtype, save_dtype, additional_args=None, resume_args=None, train_text_encoder='disabled', 
-                      gradient_checkpointing="enabled", prompt=None, extra_pnginfo=None, clip_l_lr=0, clip_g_lr=0, loss_args=None, network_config=None, **kwargs):
+                      gradient_checkpointing="enabled", prompt=None, extra_pnginfo=None, clip_l_lr=0, clip_g_lr=0, loss_args=None, network_config=None,
+                      output_only_lora=False, gradient_accumulation_steps=None, cuda_memory_cap_percent=None, **kwargs):
         mm.soft_empty_cache()
         
         output_dir = os.path.abspath(kwargs.get("output_dir"))
@@ -159,7 +165,7 @@ class InitSDXLLoRATraining:
             "sample_prompts": positive_prompts,
             "negative_prompts": negative_prompts,
             "save_precision": save_dtype,
-            "mixed_precision": "bf16",
+            "mixed_precision": "fp16",
             "num_cpu_threads_per_process": 1,
             "pretrained_model_name_or_path": SDXL_models["checkpoint"],
             "save_model_as": "safetensors",
@@ -218,6 +224,12 @@ class InitSDXLLoRATraining:
 
         if resume_args:
             config_dict.update(resume_args)
+
+        config_dict["output_only_lora"] = output_only_lora
+        if gradient_accumulation_steps is not None:
+            config_dict["gradient_accumulation_steps"] = gradient_accumulation_steps
+        if cuda_memory_cap_percent is not None:
+            config_dict["cuda_memory_cap_percent"] = cuda_memory_cap_percent
 
         for key, value in config_dict.items():
             setattr(args, key, value)

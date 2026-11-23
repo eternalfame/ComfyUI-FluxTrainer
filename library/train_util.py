@@ -6005,7 +6005,22 @@ def load_prompts(prompt_file: str) -> List[Dict]:
     return prompts
 
 
-def sample_images_common(
+def _apply_negative_prompts(args, prompts):
+    """Apply shared or per-sample negative prompts, honoring inline overrides."""
+    negatives = [str(n).strip() for n in (getattr(args, "negative_prompts", None) or [])]
+    if not any(negatives):
+        return
+    if len(negatives) not in (1, len(prompts)):
+        logger.warning(f"negative prompts: {len(negatives)} given for {len(prompts)} prompts; extra/missing ones are ignored/empty")
+    for i, prompt_dict in enumerate(prompts):
+        if prompt_dict.get("negative_prompt"):
+            continue
+        negative = negatives[0] if len(negatives) == 1 else (negatives[i] if i < len(negatives) else "")
+        if negative:
+            prompt_dict["negative_prompt"] = negative
+
+
+def _sample_images_common_impl(
     pipe_class,
     accelerator: Accelerator,
     args: argparse.Namespace,
@@ -6025,6 +6040,7 @@ def sample_images_common(
     StableDiffusionLongPromptWeightingPipelineの改造版を使うようにしたので、clip skipおよびプロンプトの重みづけに対応した
     TODO Use strategies here
     """
+    clean_memory_on_device(accelerator.device)
 
     logger.info("")
     logger.info(f"generating sample images at step: {steps}")
@@ -6032,7 +6048,7 @@ def sample_images_common(
     distributed_state = PartialState()  # for multi gpu distributed inference. this is a singleton, so it's safe to use it here
 
     org_vae_device = vae.device  # CPUにいるはず
-    vae.to(distributed_state.device)  # distributed_state.device is same as accelerator.device
+    # vae.to(distributed_state.device)  # distributed_state.device is same as accelerator.device
 
     # unwrap unet and text_encoder(s)
     unet = accelerator.unwrap_model(unet)
@@ -6061,6 +6077,8 @@ def sample_images_common(
         prompt_dict["enum"] = i
         prompt_dict.pop("subset", None)
 
+    _apply_negative_prompts(args, prompts)
+
     default_scheduler = get_my_scheduler(sample_sampler=args.sample_sampler, v_parameterization=args.v_parameterization)
 
     pipeline = pipe_class(
@@ -6088,11 +6106,18 @@ def sample_images_common(
 
     with torch.no_grad():
         image_tensor_list = []
+        pending = []  # (latents, finish)
         for prompt_dict in prompts:
-            image_tensor = sample_image_inference(
-                accelerator, args, pipeline, save_dir, prompt_dict, epoch, steps, prompt_replacement, controlnet=controlnet, validation_settings=validation_settings
+            sample_image_inference(
+                accelerator, args, pipeline, save_dir, prompt_dict, epoch, steps, prompt_replacement, controlnet=controlnet, validation_settings=validation_settings,
+                decode_later=pending,
             )
-            image_tensor_list.append(image_tensor)
+        if hasattr(pipeline, "latents_to_images"):
+            decoded = pipeline.latents_to_images([latents for latents, _ in pending])
+        else:
+            decoded = [pipeline.latents_to_image(latents) for latents, _ in pending]
+        for (_, finish), (image, tensors) in zip(pending, decoded):
+            image_tensor_list.append(finish(image, tensors))
 
     # clear pipeline and cache to reduce vram usage
     del pipeline
@@ -6106,6 +6131,47 @@ def sample_images_common(
     return torch.cat(image_tensor_list, dim=0)
 
 
+TRAIN_MEMORY_FRACTION = 0.9
+
+
+def get_training_memory_fraction(args):
+    percent = getattr(args, "cuda_memory_cap_percent", None)
+    if percent is None:
+        return 1.0 if getattr(args, "highvram", False) else TRAIN_MEMORY_FRACTION
+    if not 0 <= percent <= 100:
+        raise ValueError("CUDA memory cap must be between 0 and 100 percent.")
+    return percent / 100 if percent else 1.0
+
+
+def sample_images_common(
+    pipe_class,
+    accelerator,
+    args,
+    epoch,
+    steps,
+    device,
+    vae,
+    tokenizer,
+    text_encoder,
+    unet,
+    validation_settings=None,
+    prompt_replacement=None,
+    controlnet=None,
+):
+    """Allow the VAE to use the full CUDA budget during sampling, then restore the training cap."""
+    cuda_device = torch.device(device)
+    if cuda_device.type == "cuda":
+        torch.cuda.set_per_process_memory_fraction(1.0, cuda_device)
+    try:
+        return _sample_images_common_impl(
+            pipe_class, accelerator, args, epoch, steps, device, vae, tokenizer, text_encoder, unet,
+            validation_settings=validation_settings, prompt_replacement=prompt_replacement, controlnet=controlnet,
+        )
+    finally:
+        if cuda_device.type == "cuda":
+            torch.cuda.set_per_process_memory_fraction(get_training_memory_fraction(args), cuda_device)
+
+
 def sample_image_inference(
     accelerator: Accelerator,
     args: argparse.Namespace,
@@ -6117,6 +6183,7 @@ def sample_image_inference(
     prompt_replacement=None,
     controlnet=None,
     validation_settings=None,
+    decode_later=None,
 ):
     assert isinstance(prompt_dict, dict)
     if validation_settings is not None:
@@ -6190,28 +6257,33 @@ def sample_image_inference(
         with torch.cuda.device(torch.cuda.current_device()):
             torch.cuda.empty_cache()
 
-    image, tensors = pipeline.latents_to_image(latents)
+    def _finish(image, tensors):
+        # adding accelerator.wait_for_everyone() here should sync up and ensure that sample images are saved in the same order as the original prompt list
+        # but adding 'enum' to the filename should be enough
 
-    # adding accelerator.wait_for_everyone() here should sync up and ensure that sample images are saved in the same order as the original prompt list
-    # but adding 'enum' to the filename should be enough
-
-    ts_str = time.strftime("%Y%m%d%H%M%S", time.localtime())
-    num_suffix = f"e{epoch:06d}" if epoch is not None else f"{steps:06d}"
-    seed_suffix = "" if seed is None else f"_{seed}"
-    i: int = prompt_dict["enum"]
-    img_filename = f"{'' if args.output_name is None else args.output_name + '_'}{num_suffix}_{i:02d}_{ts_str}{seed_suffix}.png"
-    image[0].save(os.path.join(save_dir, img_filename))
+        ts_str = time.strftime("%Y%m%d%H%M%S", time.localtime())
+        num_suffix = f"e{epoch:06d}" if epoch is not None else f"{steps:06d}"
+        seed_suffix = "" if seed is None else f"_{seed}"
+        i: int = prompt_dict["enum"]
+        img_filename = f"{'' if args.output_name is None else args.output_name + '_'}{num_suffix}_{i:02d}_{ts_str}{seed_suffix}.png"
+        image[0].save(os.path.join(save_dir, img_filename))
     
 
-    # send images to wandb if enabled
-    if "wandb" in [tracker.name for tracker in accelerator.trackers]:
-        wandb_tracker = accelerator.get_tracker("wandb")
+        # send images to wandb if enabled
+        if "wandb" in [tracker.name for tracker in accelerator.trackers]:
+            wandb_tracker = accelerator.get_tracker("wandb")
 
-        import wandb
+            import wandb
 
-        # not to commit images to avoid inconsistency between training and logging steps
-        wandb_tracker.log({f"sample_{i}": wandb.Image(image, caption=prompt)}, commit=False)  # positive prompt as a caption
-    return tensors.permute(0, 2, 3, 1)
+            # not to commit images to avoid inconsistency between training and logging steps
+            wandb_tracker.log({f"sample_{i}": wandb.Image(image, caption=prompt)}, commit=False)  # positive prompt as a caption
+        return tensors.permute(0, 2, 3, 1)
+
+    if decode_later is not None:
+        decode_later.append((latents, _finish))
+        return None
+    image, tensors = pipeline.latents_to_image(latents)
+    return _finish(image, tensors)
 
 # endregion
 
