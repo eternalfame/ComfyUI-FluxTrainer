@@ -175,7 +175,20 @@ class NetworkTrainer:
         noise_pred = unet(noisy_latents, timesteps, text_conds[0]).sample
         return noise_pred
 
+    def current_real_epoch(self):
+        """Epoch of the next optimizer update, capped at the final configured epoch."""
+        steps_per_epoch = getattr(self, "num_update_steps_per_epoch", None) or 1
+        next_epoch = self.global_step // steps_per_epoch + 1
+        return min(next_epoch, self.num_train_epochs)
+
+    def checkpoint_epoch(self):
+        """Epoch of the last optimizer update. Before training, report epoch one."""
+        steps_per_epoch = getattr(self, "num_update_steps_per_epoch", None) or 1
+        return max(0, self.global_step - 1) // steps_per_epoch + 1
+
     def all_reduce_network(self, accelerator, network):
+        if accelerator.num_processes <= 1:
+            return
         for param in network.parameters():
             if param.grad is not None:
                 param.grad = accelerator.reduce(param.grad, reduction="mean")
@@ -732,12 +745,12 @@ class NetworkTrainer:
                     weights.pop(i)
             # print(f"save model hook: {len(weights)} weights will be saved")
 
-            # save current ecpoch and step
+            # Store the completed update and its epoch, including on an exact epoch boundary.
             train_state_file = os.path.join(output_dir, "train_state.json")
-            # +1 is needed because the state is saved before current_step is set from global_step
-            logger.info(f"save train state to {train_state_file} at epoch {current_epoch.value} step {current_step.value+1}")
+            saved_epoch = self.checkpoint_epoch()
+            logger.info(f"save train state to {train_state_file} at epoch {saved_epoch} step {self.global_step}")
             with open(train_state_file, "w", encoding="utf-8") as f:
-                json.dump({"current_epoch": current_epoch.value, "current_step": current_step.value + 1}, f)
+                json.dump({"current_epoch": saved_epoch, "current_step": self.global_step}, f)
 
         steps_from_state = None
 
@@ -1030,6 +1043,8 @@ class NetworkTrainer:
                 initial_step = steps_from_state
                 steps_from_state = None
 
+        resumed_global_step = initial_step
+
         if initial_step > 0:
             assert (
                 args.max_train_steps > initial_step
@@ -1044,16 +1059,12 @@ class NetworkTrainer:
                         f"initial_step is specified but not resuming. lr scheduler will be started from the beginning"
                     )
                 logger.info(f"skipping {initial_step} steps")
-                initial_step *= args.gradient_accumulation_steps
-
-                # set epoch to start to make initial_step less than len(train_dataloader)
-                epoch_to_start = initial_step // math.ceil(len(train_dataloader) / args.gradient_accumulation_steps)
+                epoch_to_start, updates_in_epoch = divmod(initial_step, num_update_steps_per_epoch)
+                initial_step = updates_in_epoch * args.gradient_accumulation_steps
             else:
                 # if not, only epoch no is skipped for informative purpose
                 epoch_to_start = initial_step // math.ceil(len(train_dataloader) / args.gradient_accumulation_steps)
                 initial_step = 0  # do not skip
-
-        
 
         noise_scheduler = self.get_noise_scheduler(args, accelerator.device)
 
@@ -1113,13 +1124,8 @@ class NetworkTrainer:
         # For --sample_at_first
         #self.sample_images(accelerator, args, 0, global_step, accelerator.device, vae, tokenizers, text_encoder, unet)
 
-        self.global_step = 0
+        self.global_step = resumed_global_step
         # training loop
-        if initial_step > 0:  # only if skip_until_initial_step is specified
-            for skip_epoch in range(epoch_to_start):  # skip epochs
-                logger.info(f"skipping epoch {skip_epoch+1} because initial_step (multiplied) is {initial_step}")
-                initial_step -= len(train_dataloader)
-
         # log device and dtype for each model
         logger.info(f"unet dtype: {unet_weight_dtype}, device: {unet.device}")
         for i, t_enc in enumerate(text_encoders):
@@ -1133,6 +1139,7 @@ class NetworkTrainer:
 
         self.epoch_to_start = epoch_to_start
         self.num_train_epochs = num_train_epochs
+        self.num_update_steps_per_epoch = num_update_steps_per_epoch
         self.accelerator = accelerator
         self.network = network
         self.text_encoder = text_encoder
@@ -1150,17 +1157,18 @@ class NetworkTrainer:
         self.remove_model = remove_model
         self.comfy_pbar = None
         
-        progress_bar = tqdm(range(args.max_train_steps - initial_step), smoothing=0, disable=False, desc="steps")
+        progress_bar = tqdm(total=args.max_train_steps, initial=resumed_global_step, smoothing=0, disable=False, desc="steps")
         
         def training_loop(break_at_steps, epoch):
+            break_at_steps = min(break_at_steps, args.max_train_steps)
+            if self.global_step >= break_at_steps:
+                return 0
             steps_done = 0
             
             #accelerator.print(f"\nepoch {epoch+1}/{num_train_epochs}")
-            progress_bar.set_description(f"Epoch {epoch + 1}/{num_train_epochs} - steps")
-
-            current_epoch.value = epoch + 1
-
-            metadata["ss_epoch"] = str(epoch + 1)
+            progress_bar.unpause()
+            displayed_epoch = current_epoch.value = self.current_real_epoch()
+            progress_bar.set_description(f"Epoch {displayed_epoch}/{num_train_epochs} - steps")
 
             accelerator.unwrap_model(network).on_epoch_start(text_encoder, unet)
 
@@ -1174,6 +1182,10 @@ class NetworkTrainer:
                 if self.initial_step > 0:
                     self.initial_step -= 1
                     continue
+
+                if displayed_epoch != current_epoch.value:
+                    displayed_epoch = current_epoch.value
+                    progress_bar.set_description(f"Epoch {displayed_epoch}/{num_train_epochs} - steps")
 
                 with accelerator.accumulate(training_model):
                     on_step_start_for_network(text_encoder, unet)
@@ -1296,11 +1308,16 @@ class NetworkTrainer:
                 if accelerator.sync_gradients:
                     progress_bar.update(1)
                     self.global_step += 1
+                    steps_done += 1
+                    if self.global_step % num_update_steps_per_epoch == 0:
+                        current_epoch.value = self.current_real_epoch()
+                    if self.comfy_pbar is not None:
+                        self.comfy_pbar.update_absolute(self.global_step - getattr(self, "comfy_pbar_base", 0))
 
                 current_loss = loss.detach().item()
                 self.loss_recorder.add(epoch=epoch, step=step, global_step=self.global_step, loss=current_loss)
                 avr_loss: float = self.loss_recorder.moving_average
-                logs = {"avr_loss": avr_loss}  # , "lr": lr_scheduler.get_last_lr()[0]}
+                logs = {"avr_loss": avr_loss, "lr": lr_scheduler.get_last_lr()[0]}
                 progress_bar.set_postfix(**logs)
 
                 if args.scale_weight_norms:
@@ -1314,16 +1331,13 @@ class NetworkTrainer:
 
                 if self.global_step >= break_at_steps:
                     break
-                steps_done += 1
-                self.comfy_pbar.update(1)
 
+            metadata["ss_epoch"] = str(self.checkpoint_epoch())
             if len(accelerator.trackers) > 0:
                 logs = {"loss/epoch": self.loss_recorder.moving_average}
                 accelerator.log(logs, step=epoch + 1)
   
             return steps_done
-        
-        
 
         return training_loop
 

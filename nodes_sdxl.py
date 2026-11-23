@@ -272,6 +272,7 @@ class SDXLTrainLoop:
             target_global_step = network_trainer.global_step + steps
             comfy_pbar = comfy.utils.ProgressBar(steps)
             network_trainer.comfy_pbar = comfy_pbar
+            network_trainer.comfy_pbar_base = initial_global_step
 
             network_trainer.optimizer_train_fn()
 
@@ -314,7 +315,11 @@ class SDXLTrainLoRASave:
             global_step = trainer.global_step
             
             ckpt_name = train_util.get_step_ckpt_name(trainer.args, "." + trainer.args.save_model_as, global_step)
-            trainer.save_model(ckpt_name, trainer.accelerator.unwrap_model(trainer.network), global_step, trainer.current_epoch.value + 1)
+            trainer.optimizer_eval_fn()
+            try:
+                trainer.save_model(ckpt_name, trainer.accelerator.unwrap_model(trainer.network), global_step, trainer.checkpoint_epoch())
+            finally:
+                trainer.optimizer_train_fn()
 
             remove_step_no = train_util.get_remove_step_no(trainer.args, global_step)
             if remove_step_no is not None:
@@ -355,7 +360,8 @@ class SDXLTrainEnd:
             training_loop = network_trainer["training_loop"]
             network_trainer = network_trainer["network_trainer"]
             
-            network_trainer.metadata["ss_epoch"] = str(network_trainer.num_train_epochs)
+            saved_epoch = network_trainer.checkpoint_epoch()
+            network_trainer.metadata["ss_epoch"] = str(saved_epoch)
             network_trainer.metadata["ss_training_finished_at"] = str(time.time())
 
             network = network_trainer.accelerator.unwrap_model(network_trainer.network)
@@ -367,7 +373,7 @@ class SDXLTrainEnd:
                 train_util.save_state_on_train_end(network_trainer.args, network_trainer.accelerator)
 
             ckpt_name = train_util.get_last_ckpt_name(network_trainer.args, "." + network_trainer.args.save_model_as)
-            network_trainer.save_model(ckpt_name, network, network_trainer.global_step, network_trainer.num_train_epochs, force_sync_upload=True)
+            network_trainer.save_model(ckpt_name, network, network_trainer.global_step, saved_epoch, force_sync_upload=True)
             logger.info("model saved.")
 
             final_lora_name = str(network_trainer.args.output_name)
@@ -430,7 +436,7 @@ class SDXLTrainValidate:
         params = (
             network_trainer.accelerator,
             network_trainer.args,
-            network_trainer.current_epoch.value, 
+            network_trainer.checkpoint_epoch(),
             network_trainer.global_step,
             network_trainer.accelerator.device,
             network_trainer.vae,
@@ -441,9 +447,11 @@ class SDXLTrainValidate:
         )
         network_trainer.optimizer_eval_fn()
         with torch.inference_mode(False):
-            image_tensors = network_trainer.sample_images(*params)
+            try:
+                image_tensors = network_trainer.sample_images(*params)
+            finally:
+                network_trainer.optimizer_train_fn()
 
-        
         trainer = {
             "network_trainer": network_trainer,
             "training_loop": training_loop,

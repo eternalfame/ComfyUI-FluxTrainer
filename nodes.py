@@ -903,6 +903,7 @@ class FluxTrainLoop:
             target_global_step = network_trainer.global_step + steps
             comfy_pbar = comfy.utils.ProgressBar(steps)
             network_trainer.comfy_pbar = comfy_pbar
+            network_trainer.comfy_pbar_base = initial_global_step
 
             network_trainer.optimizer_train_fn()
 
@@ -949,6 +950,7 @@ class FluxTrainAndValidateLoop:
             target_global_step = network_trainer.args.max_train_steps
             comfy_pbar = comfy.utils.ProgressBar(target_global_step)
             network_trainer.comfy_pbar = comfy_pbar
+            network_trainer.comfy_pbar_base = 0
 
             network_trainer.optimizer_train_fn()
 
@@ -981,7 +983,7 @@ class FluxTrainAndValidateLoop:
 
     def validate(self, network_trainer, validation_settings=None):
         params = ( 
-            network_trainer.current_epoch.value, 
+            network_trainer.checkpoint_epoch() if hasattr(network_trainer, "checkpoint_epoch") else network_trainer.current_epoch.value,
             network_trainer.global_step,
             validation_settings
         )
@@ -993,7 +995,7 @@ class FluxTrainAndValidateLoop:
     def save(self, network_trainer):
         ckpt_name = train_util.get_step_ckpt_name(network_trainer.args, "." + network_trainer.args.save_model_as, network_trainer.global_step)
         network_trainer.optimizer_eval_fn()
-        network_trainer.save_model(ckpt_name, network_trainer.accelerator.unwrap_model(network_trainer.network), network_trainer.global_step, network_trainer.current_epoch.value + 1)
+        network_trainer.save_model(ckpt_name, network_trainer.accelerator.unwrap_model(network_trainer.network), network_trainer.global_step, network_trainer.checkpoint_epoch())
         network_trainer.optimizer_train_fn()
         print("Saving at step:", network_trainer.global_step)
 
@@ -1019,7 +1021,11 @@ class FluxTrainSave:
             global_step = trainer.global_step
             
             ckpt_name = train_util.get_step_ckpt_name(trainer.args, "." + trainer.args.save_model_as, global_step)
-            trainer.save_model(ckpt_name, trainer.accelerator.unwrap_model(trainer.network), global_step, trainer.current_epoch.value + 1)
+            trainer.optimizer_eval_fn()
+            try:
+                trainer.save_model(ckpt_name, trainer.accelerator.unwrap_model(trainer.network), global_step, trainer.checkpoint_epoch())
+            finally:
+                trainer.optimizer_train_fn()
 
             remove_step_no = train_util.get_remove_step_no(trainer.args, global_step)
             if remove_step_no is not None:
@@ -1102,7 +1108,8 @@ class FluxTrainEnd:
             training_loop = network_trainer["training_loop"]
             network_trainer = network_trainer["network_trainer"]
             
-            network_trainer.metadata["ss_epoch"] = str(network_trainer.num_train_epochs)
+            saved_epoch = network_trainer.checkpoint_epoch()
+            network_trainer.metadata["ss_epoch"] = str(saved_epoch)
             network_trainer.metadata["ss_training_finished_at"] = str(time.time())
 
             network = network_trainer.accelerator.unwrap_model(network_trainer.network)
@@ -1114,7 +1121,7 @@ class FluxTrainEnd:
                 train_util.save_state_on_train_end(network_trainer.args, network_trainer.accelerator)
 
             ckpt_name = train_util.get_last_ckpt_name(network_trainer.args, "." + network_trainer.args.save_model_as)
-            network_trainer.save_model(ckpt_name, network, network_trainer.global_step, network_trainer.num_train_epochs, force_sync_upload=True)
+            network_trainer.save_model(ckpt_name, network, network_trainer.global_step, saved_epoch, force_sync_upload=True)
             logger.info("model saved.")
 
             final_lora_name = str(network_trainer.args.output_name)
