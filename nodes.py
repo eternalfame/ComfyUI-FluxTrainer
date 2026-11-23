@@ -22,6 +22,7 @@ from .library.device_utils import init_ipex
 init_ipex()
 
 from .library import train_util
+from .library.trainer_teardown import release_trainer
 from .train_network import setup_parser as train_network_setup_parser
 import matplotlib
 matplotlib.use('Agg')
@@ -1136,6 +1137,7 @@ class FluxTrainEnd:
             # metadata
             metadata = json.dumps(network_trainer.metadata, indent=2)
 
+            release_trainer(network_trainer, training_loop)
             training_loop = None
             network_trainer = None
             mm.soft_empty_cache()
@@ -1294,8 +1296,8 @@ class VisualizeLoss:
              },
         }
 
-    RETURN_TYPES = ("IMAGE", "FLOAT",)
-    RETURN_NAMES = ("plot", "loss_list",)
+    RETURN_TYPES = ("IMAGE", "FLOAT", "NETWORKTRAINER")
+    RETURN_NAMES = ("plot", "loss_list", "network_trainer")
     FUNCTION = "draw"
     CATEGORY = "FluxTrainer"
 
@@ -1338,7 +1340,7 @@ class VisualizeLoss:
         image_tensor = transforms.ToTensor()(image)
         image_tensor = image_tensor.unsqueeze(0).permute(0, 2, 3, 1).cpu().float()
 
-        return image_tensor, loss_values,
+        return image_tensor, loss_values, network_trainer,
 
 class FluxKohyaInferenceSampler:
     @classmethod
