@@ -6166,7 +6166,8 @@ def sample_images_common(
     """Allow the VAE to use the full CUDA budget during sampling, then restore the training cap."""
     cuda_device = torch.device(device)
     if cuda_device.type == "cuda":
-        torch.cuda.set_per_process_memory_fraction(1.0, cuda_device)
+        device_index = cuda_device.index if cuda_device.index is not None else torch.cuda.current_device()
+        torch.cuda.set_per_process_memory_fraction(1.0, device_index)
     try:
         return _sample_images_common_impl(
             pipe_class, accelerator, args, epoch, steps, device, vae, tokenizer, text_encoder, unet,
@@ -6174,7 +6175,7 @@ def sample_images_common(
         )
     finally:
         if cuda_device.type == "cuda":
-            torch.cuda.set_per_process_memory_fraction(get_training_memory_fraction(args), cuda_device)
+            torch.cuda.set_per_process_memory_fraction(get_training_memory_fraction(args), device_index)
 
 
 def sample_image_inference(
