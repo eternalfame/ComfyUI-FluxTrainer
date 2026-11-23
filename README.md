@@ -1,5 +1,9 @@
 # ComfyUI Flux Trainer
 
+This project is designed to make **SDXL LoRA training possible on graphics cards with 4 GB of VRAM**. Training was tested at 512×512 and 1024×1024 on a GeForce GTX 1050 Ti using block swapping and CPU text encoders. See [SDXL CUDA memory](#sdxl-cuda-memory) for the available settings.
+
+Original readme below:
+
 Wrapper for slightly modified kohya's training scripts: https://github.com/kohya-ss/sd-scripts
 
 Including code from: https://github.com/KohakuBlueleaf/Lycoris
